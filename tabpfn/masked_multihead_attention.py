@@ -44,9 +44,16 @@ class MultiHeadAttention2(nn.Module):
         self.linear_k = nn.Linear(in_features, in_features, bias)
         self.linear_v = nn.Linear(in_features, in_features, bias)
         self.linear_o = nn.Linear(in_features, in_features, bias)
+        self.batch_mask = None
 
     def forward(self, q, k, v, mask=None):
+        print("hiagain")
+        # given q,k,v
+        # is # sequence length  (examples in dataset) x # batch size (number of datasets)
+        # x # embedding dim (number of features in dataset)
         q,k,v = q.swapdims(1,0), k.swapdims(1,0), v.swapdims(1,0)
+        # now swap batch size first, sequence lengths econd
+
         q, k, v = self.linear_q(q), self.linear_k(k), self.linear_v(v)
         if self.activation is not None:
             q = self.activation(q)
@@ -64,7 +71,9 @@ class MultiHeadAttention2(nn.Module):
         if self.activation is not None:
             y = self.activation(y)
         y = y.swapdims(1,0)
-        return y, attention.mean(dim=0)
+        avg_attention = attention.view(
+            -1, self.head_num, attention.shape[1], attention.shape[2]).mean(dim=1)
+        return y, avg_attention
 
     @staticmethod
     def gen_history_mask(x):
