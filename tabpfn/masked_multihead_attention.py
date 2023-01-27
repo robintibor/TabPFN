@@ -7,20 +7,23 @@ import torch.nn.functional as F
 
 
 class ScaledDotProductAttention(nn.Module):
-
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, seq_attention_mask=None):
         dk = query.size()[-1]
         scores = query.matmul(key.transpose(-2, -1)) / math.sqrt(dk)
-        print("query shape", query.shape)
-        print("key shape", key.shape)
-        print("value shape", value.shape)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
+
         attention = F.softmax(scores, dim=-1)
+        #if dim -1 sums to 1 then this is what we need to
+        # remove tokens via mask
+        if seq_attention_mask is not None:
+            attention = attention * seq_attention_mask.view(1,1,-1)
+            attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(
+                1e-20)
         return attention.matmul(value), attention
 
 
-class MultiHeadAttention2(nn.Module):
+class MaskedMultiHeadAttention(nn.Module):
 
     def __init__(self,
                  in_features,
@@ -44,10 +47,10 @@ class MultiHeadAttention2(nn.Module):
         self.linear_k = nn.Linear(in_features, in_features, bias)
         self.linear_v = nn.Linear(in_features, in_features, bias)
         self.linear_o = nn.Linear(in_features, in_features, bias)
-        self.batch_mask = None
+        self.seq_attention_mask = None
+        self.avg_attentions = []
 
     def forward(self, q, k, v, mask=None):
-        print("hiagain")
         # given q,k,v
         # is # sequence length  (examples in dataset) x # batch size (number of datasets)
         # x # embedding dim (number of features in dataset)
@@ -64,7 +67,9 @@ class MultiHeadAttention2(nn.Module):
         v = self._reshape_to_batches(v)
         if mask is not None:
             mask = mask.repeat(self.head_num, 1, 1)
-        y, attention = ScaledDotProductAttention()(q, k, v, mask)
+        y, attention = ScaledDotProductAttention()(
+            q, k, v, mask,
+            seq_attention_mask=self.seq_attention_mask)
         y = self._reshape_from_batches(y)
 
         y = self.linear_o(y)
@@ -73,6 +78,7 @@ class MultiHeadAttention2(nn.Module):
         y = y.swapdims(1,0)
         avg_attention = attention.view(
             -1, self.head_num, attention.shape[1], attention.shape[2]).mean(dim=1)
+        self.avg_attentions.append(avg_attention.mean(dim=1))
         return y, avg_attention
 
     @staticmethod
