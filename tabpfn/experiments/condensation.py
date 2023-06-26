@@ -468,157 +468,18 @@ def run_exp(
     ensemble_configurations = ensemble_configurations[0:N_ensemble_configurations]
     # if N_ensemble_configurations == 1:
     #    ensemble_configurations = [default_ensemble_config]
-    def preprocess_input(eval_xs, preprocess_transform):
-        import warnings
 
-        if eval_xs.shape[1] > 1:
-            raise Exception("Transforms only allow one batch dim - TODO")
-        if preprocess_transform != "none":
-            if preprocess_transform == "power" or preprocess_transform == "power_all":
-                pt = PowerTransformer(standardize=True)
-            elif (
-                preprocess_transform == "quantile"
-                or preprocess_transform == "quantile_all"
-            ):
-                pt = QuantileTransformer(output_distribution="normal")
-            elif (
-                preprocess_transform == "robust" or preprocess_transform == "robust_all"
-            ):
-                pt = RobustScaler(unit_variance=True)
+    inputs, labels, yeo_params = get_inputs_for_ensemble(
+        eval_xs, eval_ys, ensemble_configurations,
+        style,
+        num_classes=num_classes,
+        max_features=max_features, extend_features=extend_features,
+        normalize_with_test=normalize_with_test,
+        eval_position=eval_position,
+        normalize_with_sqrt=normalize_with_sqrt,
+        normalize_to_ranking=normalize_to_ranking,
+        yeo_params_per_transform=None)
 
-        # eval_xs, eval_ys = normalize_data(eval_xs), normalize_data(eval_ys)
-        eval_xs = normalize_data(
-            eval_xs, normalize_positions=-1 if normalize_with_test else eval_position
-        )
-
-        # Removing empty features
-        eval_xs = eval_xs[:, 0, :]
-        sel = [
-            len(torch.unique(eval_xs[0 : eval_ys.shape[0], col])) > 1
-            for col in range(eval_xs.shape[1])
-        ]
-        eval_xs = eval_xs[:, sel]
-
-        warnings.simplefilter("error")
-        if preprocess_transform != "none":
-            eval_xs = eval_xs.cpu().numpy()
-            feats = (
-                set(range(eval_xs.shape[1]))
-                if "all" in preprocess_transform
-                else set(range(eval_xs.shape[1])) - set(categorical_feats)
-            )
-            for col in feats:
-                try:
-                    pt.fit(eval_xs[0:eval_position, col : col + 1])
-                    trans = pt.transform(eval_xs[:, col : col + 1])
-                    # print(scipy.stats.spearmanr(trans[~np.isnan(eval_xs[:, col:col+1])], eval_xs[:, col:col+1][~np.isnan(eval_xs[:, col:col+1])]))
-                    eval_xs[:, col : col + 1] = trans
-                except:
-                    pass
-            eval_xs = torch.tensor(eval_xs).float()
-        warnings.simplefilter("default")
-
-        eval_xs = eval_xs.unsqueeze(1)
-
-        # TODO: Cautian there is information leakage when to_ranking is used, we should not use it
-        eval_xs = (
-            remove_outliers(
-                eval_xs,
-                normalize_positions=-1 if normalize_with_test else eval_position,
-            )
-            if not normalize_to_ranking
-            else normalize_data(to_ranking_low_mem(eval_xs))
-        )
-        # Rescale X
-        eval_xs = normalize_by_used_features_f(
-            eval_xs,
-            eval_xs.shape[-1],
-            max_features,
-            normalize_with_sqrt=normalize_with_sqrt,
-        )
-
-        return eval_xs.detach().to(device)
-
-    from tabpfn.utils import normalize_data
-
-    output = None
-
-    eval_xs_transformed = {}
-    inputs, labels = [], []
-    start = time.time()
-    for ensemble_configuration in ensemble_configurations:
-        (
-            (class_shift_configuration, feature_shift_configuration),
-            preprocess_transform_configuration,
-            styles_configuration,
-        ) = ensemble_configuration
-
-        style_ = (
-            style[styles_configuration : styles_configuration + 1, :]
-            if style is not None
-            else style
-        )
-        softmax_temperature_ = softmax_temperature[styles_configuration]
-
-        eval_xs_, eval_ys_ = eval_xs.clone(), eval_ys.clone()
-
-        if preprocess_transform_configuration in eval_xs_transformed:
-            eval_xs_ = eval_xs_transformed[preprocess_transform_configuration].clone()
-        else:
-            if eval_xs_.shape[-1] * 3 < max_features and combine_preprocessing:
-                eval_xs_ = torch.cat(
-                    [
-                        preprocess_input(eval_xs_, preprocess_transform="power_all"),
-                        preprocess_input(eval_xs_, preprocess_transform="quantile_all"),
-                    ],
-                    -1,
-                )
-                eval_xs_ = normalize_data(
-                    eval_xs_,
-                    normalize_positions=-1 if normalize_with_test else eval_position,
-                )
-                # eval_xs_ = torch.stack([preprocess_input(eval_xs_, preprocess_transform='power_all'),
-                #                        preprocess_input(eval_xs_, preprocess_transform='robust_all'),
-                #                        preprocess_input(eval_xs_, preprocess_transform='none')], -1)
-                # eval_xs_ = torch.flatten(torch.swapaxes(eval_xs_, -2, -1), -2)
-            else:
-                eval_xs_ = preprocess_input(
-                    eval_xs_, preprocess_transform=preprocess_transform_configuration
-                )
-            eval_xs_transformed[preprocess_transform_configuration] = eval_xs_
-
-        eval_ys_ = ((eval_ys_ + class_shift_configuration) % num_classes).float()
-
-        eval_xs_ = torch.cat(
-            [
-                eval_xs_[..., feature_shift_configuration:],
-                eval_xs_[..., :feature_shift_configuration],
-            ],
-            dim=-1,
-        )
-
-        # Extend X
-        if extend_features:
-            eval_xs_ = torch.cat(
-                [
-                    eval_xs_,
-                    torch.zeros(
-                        (
-                            eval_xs_.shape[0],
-                            eval_xs_.shape[1],
-                            max_features - eval_xs_.shape[2],
-                        )
-                    ).to(device),
-                ],
-                -1,
-            )
-        inputs += [eval_xs_]
-        labels += [eval_ys_]
-    batch_size_inference = 16
-    inputs = torch.cat(inputs, 1)
-    inputs = torch.split(inputs, batch_size_inference, dim=1)
-    labels = torch.cat(labels, 1)
-    labels = torch.split(labels, batch_size_inference, dim=1)
     assert len(inputs) == 1
     batch_input = inputs[0]
     batch_label = labels[0]
@@ -627,30 +488,31 @@ def run_exp(
 
     transformed_model = deepcopy(model)
 
-    for module in transformed_model.transformer_encoder.modules():
-        if hasattr(module, "self_attn"):
-            th_attn = module.self_attn
-            own_attn = MaskedMultiHeadAttention(
-                th_attn.embed_dim, th_attn.num_heads, activation=None
-            ).cuda()
-            w_q, w_k, w_v = th_attn.in_proj_weight.chunk(3)
-            b_q, b_k, b_v = th_attn.in_proj_bias.chunk(3)
-            assert w_q.shape == own_attn.linear_q.weight.shape
-            assert w_k.shape == own_attn.linear_k.weight.shape
-            assert w_v.shape == own_attn.linear_v.weight.shape
-            assert b_q.shape == own_attn.linear_q.bias.shape
-            assert b_k.shape == own_attn.linear_k.bias.shape
-            assert b_v.shape == own_attn.linear_v.bias.shape
+    if weight_synthetic_points:
+        for module in transformed_model.transformer_encoder.modules():
+            if hasattr(module, "self_attn"):
+                th_attn = module.self_attn
+                own_attn = MaskedMultiHeadAttention(
+                    th_attn.embed_dim, th_attn.num_heads, activation=None
+                ).cuda()
+                w_q, w_k, w_v = th_attn.in_proj_weight.chunk(3)
+                b_q, b_k, b_v = th_attn.in_proj_bias.chunk(3)
+                assert w_q.shape == own_attn.linear_q.weight.shape
+                assert w_k.shape == own_attn.linear_k.weight.shape
+                assert w_v.shape == own_attn.linear_v.weight.shape
+                assert b_q.shape == own_attn.linear_q.bias.shape
+                assert b_k.shape == own_attn.linear_k.bias.shape
+                assert b_v.shape == own_attn.linear_v.bias.shape
 
-            own_attn.linear_q.weight.data[:] = w_q.data[:]
-            own_attn.linear_q.bias.data[:] = b_q.data[:]
-            own_attn.linear_k.weight.data[:] = w_k.data[:]
-            own_attn.linear_k.bias.data[:] = b_k.data[:]
-            own_attn.linear_v.weight.data[:] = w_v.data[:]
-            own_attn.linear_v.bias.data[:] = b_v.data[:]
-            own_attn.linear_o.weight.data[:] = th_attn.out_proj.weight.data[:]
-            own_attn.linear_o.bias.data[:] = th_attn.out_proj.bias.data[:]
-            module.self_attn = own_attn
+                own_attn.linear_q.weight.data[:] = w_q.data[:]
+                own_attn.linear_q.bias.data[:] = b_q.data[:]
+                own_attn.linear_k.weight.data[:] = w_k.data[:]
+                own_attn.linear_k.bias.data[:] = b_k.data[:]
+                own_attn.linear_v.weight.data[:] = w_v.data[:]
+                own_attn.linear_v.bias.data[:] = b_v.data[:]
+                own_attn.linear_o.weight.data[:] = th_attn.out_proj.weight.data[:]
+                own_attn.linear_o.bias.data[:] = th_attn.out_proj.bias.data[:]
+                module.self_attn = own_attn
 
     with torch.no_grad():
         merged_orig_output = predict_outputs(
@@ -694,12 +556,12 @@ def run_exp(
     opt_syn_X_y = torch.optim.AdamW(params_to_optim, weight_decay=0)
 
     for i_epoch in trange(n_epochs):
-        softmaxed_seq_attn_mask = torch.nn.functional.softmax(seq_attn_alphas, dim=0)
-
-        for module in transformed_model.transformer_encoder.modules():
-            if hasattr(module, "seq_attention_mask"):
-                module.seq_attention_mask = softmaxed_seq_attn_mask
-                module.avg_attentions = []
+        if weight_synthetic_points:
+            softmaxed_seq_attn_mask = torch.nn.functional.softmax(seq_attn_alphas, dim=0)
+            for module in transformed_model.transformer_encoder.modules():
+                if hasattr(module, "seq_attention_mask"):
+                    module.seq_attention_mask = softmaxed_seq_attn_mask
+                    module.avg_attentions = []
         merged_output = predict_outputs(
             transformed_model,
             torch.cat((syn_X, train_input)),
@@ -714,14 +576,15 @@ def run_exp(
         opt_syn_X_y.zero_grad(set_to_none=True)
         acc = torch.mean(1.0 * (merged_output.argmax(dim=1).cpu() == train_ys)).item()
         if i_epoch % max(1, n_epochs // 10) == 0:
-            with torch.no_grad():
-                softmaxed_seq_attn_mask = torch.nn.functional.softmax(
-                    seq_attn_alphas, dim=0
-                )
-                for module in transformed_model.transformer_encoder.modules():
-                    if hasattr(module, "seq_attention_mask"):
-                        module.seq_attention_mask = softmaxed_seq_attn_mask
-                        module.avg_attentions = []
+            if weight_synthetic_points:
+                with torch.no_grad():
+                    softmaxed_seq_attn_mask = torch.nn.functional.softmax(
+                        seq_attn_alphas, dim=0
+                    )
+                    for module in transformed_model.transformer_encoder.modules():
+                        if hasattr(module, "seq_attention_mask"):
+                            module.seq_attention_mask = softmaxed_seq_attn_mask
+                            module.avg_attentions = []
             merged_output = predict_outputs(
                 transformed_model,
                 torch.cat((syn_X, test_input)),

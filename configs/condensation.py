@@ -36,6 +36,7 @@ def get_grid_param_list():
     debug_params = [
         {
             "debug": False,
+            "version": "preproc_with_grad",
         }
     ]
 
@@ -50,7 +51,7 @@ def get_grid_param_list():
         {
             "proxy_labels": ["tabpfn"],
             "n_epochs": [500],
-            "weight_synthetic_points": [True],
+            "weight_synthetic_points": [False],
         }
     )
 
@@ -78,9 +79,11 @@ def run(
     n_epochs,
     weight_synthetic_points,
     debug,
+    version,
 ):
     kwargs = locals()
     kwargs.pop("ex")
+    kwargs.pop("version")
     if not debug:
         log.setLevel("INFO")
     file_obs = ex.observers[0]
