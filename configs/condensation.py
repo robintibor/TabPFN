@@ -29,7 +29,7 @@ def get_grid_param_list():
 
     save_params = [
         {
-            "save_folder": "/work/dlclarge1/schirrmr-tabpfn/exps/subsample-fixed-n-samples/",
+            "save_folder": "/work/dlclarge1/schirrmr-tabpfn/exps/condensation/",
         }
     ]
 
@@ -42,18 +42,15 @@ def get_grid_param_list():
     data_params = dictlistprod(
         {
             "dataset_id": range(30),
+            "n_samples": [2,4,8,16,32,64,128,256,]#2,4,8,16,32 check missing
         }
     )
 
     train_params = dictlistprod(
         {
-            "proxy_labels": ["train"],
-        }
-    )
-
-    random_params = dictlistprod(
-        {
-            "np_th_seed": range(0, 1),
+            "proxy_labels": ["tabpfn"],
+            "n_epochs": [500],
+            "weight_synthetic_points": [True],
         }
     )
 
@@ -61,7 +58,6 @@ def get_grid_param_list():
         [
             save_params,
             data_params,
-            random_params,
             train_params,
             debug_params,
         ]
@@ -77,8 +73,10 @@ def sample_config_params(rng, params):
 def run(
     ex,
     dataset_id,
-    np_th_seed,
     proxy_labels,
+    n_samples,
+    n_epochs,
+    weight_synthetic_points,
     debug,
 ):
     kwargs = locals()
@@ -98,7 +96,7 @@ def run(
     )
     start_time = time.time()
     ex.info["finished"] = False
-    from tabpfn.experiments.subsample import run_exp
+    from tabpfn.experiments.condensation import run_exp
 
     results = run_exp(**kwargs)
     end_time = time.time()

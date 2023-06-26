@@ -25,6 +25,8 @@ def run_exp(
     output_dir,
     debug,
 ):
+    tqdm = lambda x: x
+    trange = range
     max_samples = 10000
     bptt = 10000
 
@@ -99,25 +101,32 @@ def run_exp(
     orig_prediction_ = classifier.predict_proba(test_xs)
     orig_predicted_labels = orig_prediction_.argmax(axis=1)
 
+    # impadd
+    orig_prediction_train = classifier.predict_proba(train_xs)
+    orig_predicted_train_labels = orig_prediction_train.argmax(axis=1)
+
     wanted_train_inds = np.arange(len(train_xs))
+    n_intermediate_samples_per_step = np.maximum(
+        np.round(len(train_xs) / (2 ** np.arange(1, np.ceil(np.log2(len(train_xs)))))),
+        2,
+    )
+    n_intermediate_samples_per_step = np.int64(n_intermediate_samples_per_step)
 
     rng = np.random.RandomState(np_th_seed)
     intermediate_train_inds = []
     intermediate_results = []
-    for i_removal in range(int(np.ceil(np.log2(len(wanted_train_inds)))) - 1):
+    for n_intermediate_samples in tqdm(n_intermediate_samples_per_step):
         best_acc = -np.inf
-        best_acc_to_test_labels = -np.inf
-        best_acc_to_orig_preds = -np.inf
         i_tries = len(wanted_train_inds)
         next_train_inds = []
-        for i_try in range(i_tries):
-            n_samples = int(np.ceil(len(wanted_train_inds) / 2))
-            this_train_inds = rng.choice(wanted_train_inds, n_samples, replace=False)
+        for i_try in trange(i_tries):
+            this_train_inds = rng.choice(
+                wanted_train_inds, n_intermediate_samples, replace=False
+            )
             included_classes = np.unique(train_ys[this_train_inds])
             if len(included_classes) == 1:
-                missing_class = 1 - included_classes[0]
                 ind_other_class = rng.choice(
-                    wanted_train_inds[train_ys[wanted_train_inds] == missing_class],
+                    wanted_train_inds[train_ys[wanted_train_inds] != included_classes[0]],
                     1,
                     replace=False,
                 )[0]
@@ -125,18 +134,25 @@ def run_exp(
 
             classifier.fit(train_xs[this_train_inds], train_ys[this_train_inds])
             prediction_ = classifier.predict_proba(test_xs)
-            # impadd
+            prediction_train = classifier.predict_proba(train_xs)
+
             acc_to_test_labels = np.mean(test_ys.numpy() == prediction_.argmax(axis=1))
             acc_to_orig_preds = np.mean(
                 orig_predicted_labels == prediction_.argmax(axis=1)
             )
-            acc_to_use = {"tabpfn": acc_to_orig_preds, "test": acc_to_test_labels}[
-                proxy_labels
-            ]
+            acc_to_train_labels = np.mean(
+                train_ys.numpy() == prediction_train.argmax(axis=1)
+            )
+            acc_to_use = {
+                "tabpfn": acc_to_orig_preds,
+                "test": acc_to_test_labels,
+                "train": acc_to_train_labels,
+            }[proxy_labels]
             if acc_to_use > best_acc:
                 best_acc = acc_to_use
                 best_acc_to_orig_preds = acc_to_orig_preds
                 best_acc_to_test_labels = acc_to_test_labels
+                best_acc_to_train_labels = acc_to_train_labels
                 next_train_inds = this_train_inds
         wanted_train_inds = next_train_inds
         intermediate_train_inds.append(deepcopy(wanted_train_inds))
@@ -144,6 +160,7 @@ def run_exp(
             dict(
                 test_acc=best_acc_to_test_labels,
                 tabpfn_acc=best_acc_to_orig_preds,
+                train_acc=best_acc_to_train_labels,
                 n_samples=len(wanted_train_inds),
             )
         )
@@ -158,8 +175,10 @@ def run_exp(
     classifier.fit(train_xs, train_ys)
     prediction_ = classifier.predict_proba(test_xs)
     acc = np.mean(test_ys.numpy() == prediction_.argmax(axis=1))
+    acc_train = np.mean(train_ys.numpy() == orig_predicted_train_labels)
     results[f"test_acc_0"] = acc
     results[f"tabpfn_acc_0"] = 1  # by definition
+    results[f"train_acc_0"] = acc_train
     results["n_samples_0"] = len(train_xs)
 
     intermediate_df = pd.DataFrame(intermediate_results)
