@@ -470,15 +470,19 @@ def run_exp(
     #    ensemble_configurations = [default_ensemble_config]
 
     inputs, labels, yeo_params = get_inputs_for_ensemble(
-        eval_xs, eval_ys, ensemble_configurations,
+        eval_xs,
+        eval_ys,
+        ensemble_configurations,
         style,
         num_classes=num_classes,
-        max_features=max_features, extend_features=extend_features,
+        max_features=max_features,
+        extend_features=extend_features,
         normalize_with_test=normalize_with_test,
         eval_position=eval_position,
         normalize_with_sqrt=normalize_with_sqrt,
         normalize_to_ranking=normalize_to_ranking,
-        yeo_params_per_transform=None)
+        yeo_params_per_transform=None,
+    )
 
     assert len(inputs) == 1
     batch_input = inputs[0]
@@ -522,12 +526,14 @@ def run_exp(
             num_classes,
             ensemble_configurations,
         )
+    train_x_extra_dim = eval_xs[: len(train_xs)]
+    train_y_extra_dim = eval_ys[: len(train_xs)]
 
-    necessary_repeats = int(np.ceil(n_samples / len(train_xs)))
-    inputs_repeated = batch_input.repeat(
+    necessary_repeats = int(np.ceil(n_samples / len(train_x_extra_dim)))
+    inputs_repeated = train_x_extra_dim.repeat(
         necessary_repeats, *((1,) * (len(batch_input.shape) - 1))
     )
-    labels_repeated = batch_label.repeat(
+    labels_repeated = train_y_extra_dim.repeat(
         necessary_repeats, *((1,) * (len(batch_label.shape) - 1))
     )
 
@@ -557,15 +563,34 @@ def run_exp(
 
     for i_epoch in trange(n_epochs):
         if weight_synthetic_points:
-            softmaxed_seq_attn_mask = torch.nn.functional.softmax(seq_attn_alphas, dim=0)
+            softmaxed_seq_attn_mask = torch.nn.functional.softmax(
+                seq_attn_alphas, dim=0
+            )
+
             for module in transformed_model.transformer_encoder.modules():
                 if hasattr(module, "seq_attention_mask"):
                     module.seq_attention_mask = softmaxed_seq_attn_mask
                     module.avg_attentions = []
+        syn_X_preproced, syn_y_preproced, _ = get_inputs_for_ensemble(
+            syn_X,
+            syn_y,
+            ensemble_configurations,
+            style,
+            num_classes=num_classes,
+            max_features=max_features,
+            extend_features=extend_features,
+            normalize_with_test=normalize_with_test,
+            eval_position=eval_position,
+            normalize_with_sqrt=normalize_with_sqrt,
+            normalize_to_ranking=normalize_to_ranking,
+            yeo_params_per_transform=yeo_params,
+        )
+        syn_X_preproced = syn_X_preproced[0]
+        syn_y_preproced = syn_y_preproced[0]
         merged_output = predict_outputs(
             transformed_model,
-            torch.cat((syn_X, train_input)),
-            syn_y,
+            torch.cat((syn_X_preproced, train_input)),
+            syn_y_preproced,
             num_classes,
             ensemble_configurations,
         )
@@ -585,10 +610,26 @@ def run_exp(
                         if hasattr(module, "seq_attention_mask"):
                             module.seq_attention_mask = softmaxed_seq_attn_mask
                             module.avg_attentions = []
+            syn_X_preproced, syn_y_preproced, _ = get_inputs_for_ensemble(
+                syn_X,
+                syn_y,
+                ensemble_configurations,
+                style,
+                num_classes=num_classes,
+                max_features=max_features,
+                extend_features=extend_features,
+                normalize_with_test=normalize_with_test,
+                eval_position=eval_position,
+                normalize_with_sqrt=normalize_with_sqrt,
+                normalize_to_ranking=normalize_to_ranking,
+                yeo_params_per_transform=yeo_params,
+            )
+            syn_X_preproced = syn_X_preproced[0]
+            syn_y_preproced = syn_y_preproced[0]
             merged_output = predict_outputs(
                 transformed_model,
-                torch.cat((syn_X, test_input)),
-                syn_y,
+                torch.cat((syn_X_preproced, test_input)),
+                syn_y_preproced,
                 num_classes,
                 ensemble_configurations,
             )
