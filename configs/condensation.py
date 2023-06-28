@@ -36,7 +36,7 @@ def get_grid_param_list():
     debug_params = [
         {
             "debug": False,
-            "version": "preproc_with_grad",
+            "version": "precomputed_mean_std",
         }
     ]
 
@@ -52,6 +52,8 @@ def get_grid_param_list():
             "proxy_labels": ["tabpfn"],
             "n_epochs": [500],
             "weight_synthetic_points": [False],
+            "backprop_preproc": [True],
+            "N_ensemble_configurations": [1],
         }
     )
 
@@ -80,6 +82,8 @@ def run(
     weight_synthetic_points,
     debug,
     version,
+    backprop_preproc,
+    N_ensemble_configurations,
 ):
     kwargs = locals()
     kwargs.pop("ex")
