@@ -41,8 +41,9 @@ def get_grid_param_list():
 
     data_params = dictlistprod(
         {
-            "dataset_id": range(30),
-        }
+            "dataset_id": range(10),
+            "data_collection": ["cafee"],
+                }
     )
 
     train_params = dictlistprod(
@@ -79,6 +80,7 @@ def run(
     dataset_id,
     np_th_seed,
     proxy_labels,
+    data_collection,
     debug,
 ):
     kwargs = locals()

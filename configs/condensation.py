@@ -42,18 +42,22 @@ def get_grid_param_list():
 
     data_params = dictlistprod(
         {
-            "dataset_id": range(30),
-            "n_samples": [2,4,8,16,32,64,128,256,]#2,4,8,16,32 check missing
+            "dataset_id": range(10),
+            "n_samples": [2,4,8,16,32,64,128,256,], #2,4,8,16,32 check missing
+            "data_collection": ["cafee"],
         }
     )
 
     train_params = dictlistprod(
         {
             "proxy_labels": ["tabpfn"],
-            "n_epochs": [500],
+            "n_epochs": [1000],
             "weight_synthetic_points": [False],
             "backprop_preproc": [True],
             "N_ensemble_configurations": [1],
+            "synthesize_targets": [False],
+            "zero_nonexistent_features": [True],
+            "init_syn_random": [True],
         }
     )
 
@@ -84,6 +88,10 @@ def run(
     version,
     backprop_preproc,
     N_ensemble_configurations,
+    data_collection,
+    synthesize_targets,
+    zero_nonexistent_features,
+    init_syn_random,
 ):
     kwargs = locals()
     kwargs.pop("ex")

@@ -1,3 +1,4 @@
+import itertools
 import logging
 import os
 import random
@@ -6,15 +7,89 @@ import time
 import numpy as np
 import torch
 
-from ..datasets import load_openml_list, open_cc_dids, open_cc_valid_dids
+from ..datasets.load_data import (
+    load_from_all_datasets,
+    load_from_well_described_datasets,
+)
+from ..scripts.tabular_metrics import auc_metric
 from ..scripts.transformer_prediction_interface import TabPFNClassifier
-from ..utils import normalize_data, remove_outliers, normalize_by_used_features_f, torch_nanmean, torch_nanstd
+from ..utils import (
+    normalize_data,
+    remove_outliers,
+    normalize_by_used_features_f,
+    torch_nanmean,
+    torch_nanstd,
+)
 from sklearn.preprocessing import PowerTransformer
-from ..utils import NOP
 from copy import deepcopy
 from tabpfn.masked_multihead_attention import MaskedMultiHeadAttention
 
 log = logging.getLogger(__name__)
+
+
+def generate_ensemble_configurations(
+    differentiable_hps_as_style,
+    style,
+    seed,
+    device,
+    softmax_temperature,
+    preprocess_transform,
+    num_features,
+    feature_shift_decoder,
+    num_classes,
+    multiclass_decoder,
+    N_ensemble_configurations,
+):
+    if not differentiable_hps_as_style:
+        style = None
+
+    if style is not None:
+        style = style.to(device)
+        style = style.unsqueeze(0) if len(style.shape) == 1 else style
+        num_styles = style.shape[0]
+        softmax_temperature = (
+            softmax_temperature
+            if softmax_temperature.shape
+            else softmax_temperature.unsqueeze(0).repeat(num_styles)
+        )
+    else:
+        num_styles = 1
+        style = None
+        softmax_temperature = torch.log(torch.tensor([0.8]))
+
+    styles_configurations = range(0, num_styles)
+
+    preprocess_transform_configurations = (
+        ["none", "power_all"]
+        if preprocess_transform == "mix"
+        else [preprocess_transform]
+    )
+
+    if seed is not None:
+        torch.manual_seed(seed)
+    print(preprocess_transform_configurations)
+
+    feature_shift_configurations = (
+        torch.randperm(num_features) if feature_shift_decoder else [0]
+    )
+    class_shift_configurations = (
+        torch.randperm(num_classes) if multiclass_decoder == "permutation" else [0]
+    )
+    ensemble_configurations = list(
+        itertools.product(class_shift_configurations, feature_shift_configurations)
+    )
+    # default_ensemble_config = ensemble_configurations[0]
+    rng = random.Random(seed)
+    rng.shuffle(ensemble_configurations)
+    ensemble_configurations = list(
+        itertools.product(
+            ensemble_configurations,
+            preprocess_transform_configurations,
+            styles_configurations,
+        )
+    )
+    ensemble_configurations = ensemble_configurations[0:N_ensemble_configurations]
+    return ensemble_configurations
 
 
 def kl_divergence(clf_out_a, clf_out_b, reduction="mean"):
@@ -22,8 +97,8 @@ def kl_divergence(clf_out_a, clf_out_b, reduction="mean"):
     kl_divs_per_example = torch.sum(
         torch.nn.functional.softmax(clf_out_a, dim=1)
         * (
-                torch.nn.functional.log_softmax(clf_out_a, dim=1)
-                - torch.nn.functional.log_softmax(clf_out_b, dim=1)
+            torch.nn.functional.log_softmax(clf_out_a, dim=1)
+            - torch.nn.functional.log_softmax(clf_out_b, dim=1)
         ),
         dim=1,
     )
@@ -47,7 +122,7 @@ def predict_outputs(model, X, y, num_classes, ensemble_configurations):
             preprocess_transform_configuration,
             styles_configuration,
         ) = ensemble_configuration
-        output_ = outputs_model[:, i: i + 1, :]
+        output_ = outputs_model[:, i : i + 1, :]
         output_ = torch.cat(
             [
                 output_[..., class_shift_configuration:],
@@ -62,19 +137,20 @@ def predict_outputs(model, X, y, num_classes, ensemble_configurations):
 
 
 def get_inputs_for_ensemble(
-        eval_xs,
-        eval_ys,
-        ensemble_configurations,
-        style,
-        num_classes,
-        max_features,
-        extend_features,
-        normalize_with_test,
-        eval_position,
-        normalize_with_sqrt,
-        normalize_to_ranking,
-        yeo_params_per_transform,
-        mean_std_per_transform,
+    eval_xs,
+    eval_ys,
+    ensemble_configurations,
+    style,
+    num_classes,
+    max_features,
+    extend_features,
+    normalize_with_test,
+    eval_position,
+    normalize_with_sqrt,
+    normalize_to_ranking,
+    yeo_params_per_transform,
+    feature_mean,
+    feature_std,
 ):
     output = None
 
@@ -82,8 +158,6 @@ def get_inputs_for_ensemble(
     inputs, labels = [], []
     if yeo_params_per_transform is None:
         yeo_params_per_transform = {}
-    if mean_std_per_transform is None:
-        mean_std_per_transform = {}
     start = time.time()
     for ensemble_configuration in ensemble_configurations:
         (
@@ -93,7 +167,7 @@ def get_inputs_for_ensemble(
         ) = ensemble_configuration
 
         style_ = (
-            style[styles_configuration: styles_configuration + 1, :]
+            style[styles_configuration : styles_configuration + 1, :]
             if style is not None
             else style
         )
@@ -108,14 +182,7 @@ def get_inputs_for_ensemble(
                 ]
             else:
                 yeo_params = None
-            if preprocess_transform_configuration in mean_std_per_transform:
-                mean, std = mean_std_per_transform[
-                    preprocess_transform_configuration
-                ]
-            else:
-                mean = None
-                std = None
-            eval_xs_, yeo_params, mean, std = preprocess_input(
+            eval_xs_, yeo_params, feature_mean, feature_std = preprocess_input(
                 eval_xs_,
                 eval_ys,
                 preprocess_transform=preprocess_transform_configuration,
@@ -125,15 +192,14 @@ def get_inputs_for_ensemble(
                 eval_position=eval_position,
                 normalize_with_sqrt=normalize_with_sqrt,
                 normalize_to_ranking=normalize_to_ranking,
-                mean=mean, std=std
+                mean=feature_mean,
+                std=feature_std,
             )
             eval_xs_transformed[preprocess_transform_configuration] = eval_xs_
             if preprocess_transform_configuration not in yeo_params_per_transform:
                 yeo_params_per_transform[
                     preprocess_transform_configuration
                 ] = yeo_params
-            if preprocess_transform_configuration not in mean_std_per_transform:
-                mean_std_per_transform[preprocess_transform_configuration] = (mean, std)
 
         eval_ys_ = ((eval_ys_ + class_shift_configuration) % num_classes).float()
 
@@ -166,7 +232,7 @@ def get_inputs_for_ensemble(
     inputs = torch.split(inputs, batch_size_inference, dim=1)
     labels = torch.cat(labels, 1)
     labels = torch.split(labels, batch_size_inference, dim=1)
-    return inputs, labels, yeo_params_per_transform, mean_std_per_transform
+    return inputs, labels, yeo_params_per_transform, feature_mean, feature_std
 
 
 def normalize_data_return_mean_std(data, mean=None, std=None, normalize_positions=-1):
@@ -174,10 +240,10 @@ def normalize_data_return_mean_std(data, mean=None, std=None, normalize_position
         assert std is None
         if normalize_positions > 0:
             mean = torch_nanmean(data[:normalize_positions], dim=0)
-            std = torch_nanstd(data[:normalize_positions], dim=0) + .000001
+            std = torch_nanstd(data[:normalize_positions], dim=0) + 0.000001
         else:
             mean = torch_nanmean(data, dim=0)
-            std = torch_nanstd(data, dim=0) + .000001
+            std = torch_nanstd(data, dim=0) + 0.000001
     assert mean is not None
     assert std is not None
     data = (data - mean) / std
@@ -187,28 +253,38 @@ def normalize_data_return_mean_std(data, mean=None, std=None, normalize_position
 
 
 def preprocess_input(
-        eval_xs,
-        eval_ys,
-        preprocess_transform,
-        max_features,
-        yeo_johnson_params,
-        normalize_with_test,
-        eval_position,
-        normalize_with_sqrt,
-        normalize_to_ranking,
-        mean,
-        std,
+    eval_xs,
+    eval_ys,
+    preprocess_transform,
+    max_features,
+    yeo_johnson_params,
+    normalize_with_test,
+    eval_position,
+    normalize_with_sqrt,
+    normalize_to_ranking,
+    mean,
+    std,
 ):
     import warnings
 
     orig_device = eval_xs.device
     if eval_xs.shape[1] > 1:
         raise Exception("Transforms only allow one batch dim - TODO")
+
+
+    # eval_xs, eval_ys = normalize_data(eval_xs), normalize_data(eval_ys)
+    eval_xs, mean, std = normalize_data_return_mean_std(
+        eval_xs,
+        mean=mean,
+        std=std,
+        normalize_positions=-1 if normalize_with_test else eval_position,
+    )
+
     if preprocess_transform != "none":
         if preprocess_transform == "power" or preprocess_transform == "power_all":
             pt = PowerTransformer(standardize=True)
         elif (
-                preprocess_transform == "quantile" or preprocess_transform == "quantile_all"
+            preprocess_transform == "quantile" or preprocess_transform == "quantile_all"
         ):
             assert False
             pt = QuantileTransformer(output_distribution="normal")
@@ -216,17 +292,12 @@ def preprocess_input(
             assert False
             pt = RobustScaler(unit_variance=True)
 
-    # eval_xs, eval_ys = normalize_data(eval_xs), normalize_data(eval_ys)
-    eval_xs , mean, std = normalize_data_return_mean_std(
-        eval_xs, mean=mean, std=std, normalize_positions=-1 if normalize_with_test else eval_position
-    )
-
     # Removing empty features
     eval_xs = eval_xs[:, 0, :]
     if yeo_johnson_params is None:
         # otherwise don't remove, probably looking at synthetic data
         sel = [
-            len(torch.unique(eval_xs[0: eval_ys.shape[0], col])) > 1
+            len(torch.unique(eval_xs[0 : eval_ys.shape[0], col])) > 1
             for col in range(eval_xs.shape[1])
         ]
         eval_xs = eval_xs[:, sel]
@@ -243,7 +314,7 @@ def preprocess_input(
             )
             for col in feats:
                 try:
-                    pt.fit(eval_xs[0:eval_position, col: col + 1])
+                    pt.fit(eval_xs[0:eval_position, col : col + 1])
                     yeo_johnson_params.append(
                         deepcopy(
                             {
@@ -253,9 +324,9 @@ def preprocess_input(
                             }
                         )
                     )
-                    trans = pt.transform(eval_xs[:, col: col + 1])
+                    trans = pt.transform(eval_xs[:, col : col + 1])
                     # print(scipy.stats.spearmanr(trans[~np.isnan(eval_xs[:, col:col+1])], eval_xs[:, col:col+1][~np.isnan(eval_xs[:, col:col+1])]))
-                    eval_xs[:, col: col + 1] = trans
+                    eval_xs[:, col : col + 1] = trans
                 except:
                     yeo_johnson_params.append(None)
             eval_xs = torch.tensor(eval_xs).float()
@@ -265,12 +336,12 @@ def preprocess_input(
             for col, params in zip(feats, yeo_johnson_params):
                 if params is not None:
                     yeo_transformed = _yeo_johnson_transform_th(
-                        eval_xs[:, col: col + 1], params["lambda"]
+                        eval_xs[:, col : col + 1], params["lambda"]
                     )
                     standardized = (yeo_transformed - params["mean"]) / (
                         params["scale"]
                     )
-                    eval_xs[:, col: col + 1] = standardized
+                    eval_xs[:, col : col + 1] = standardized
 
     warnings.simplefilter("default")
 
@@ -320,105 +391,23 @@ def _yeo_johnson_transform_th(x, lmbda):
 
 
 def run_exp(
-        dataset_id,
-        n_samples,
-        proxy_labels,
-        output_dir,
-        debug,
-        n_epochs,
-        weight_synthetic_points,
-        backprop_preproc,
-        N_ensemble_configurations,
+    dataset_id,
+    n_samples,
+    proxy_labels,
+    output_dir,
+    debug,
+    n_epochs,
+    weight_synthetic_points,
+    backprop_preproc,
+    N_ensemble_configurations,
+    data_collection,
+    synthesize_targets,
+    zero_nonexistent_features,
+    init_syn_random,
 ):
     tqdm = lambda x: x
     trange = range
-    max_samples = 10000
-    bptt = 10000
 
-    cc_test_datasets_multiclass, cc_test_datasets_multiclass_df = load_openml_list(
-        open_cc_dids,
-        multiclass=True,
-        shuffled=True,
-        filter_for_nan=False,
-        max_samples=max_samples,
-        num_feats=100,
-        return_capped=True,
-    )
-    cc_valid_datasets_multiclass, cc_valid_datasets_multiclass_df = load_openml_list(
-        open_cc_valid_dids,
-        multiclass=True,
-        shuffled=True,
-        filter_for_nan=False,
-        max_samples=max_samples,
-        num_feats=100,
-        return_capped=True,
-    )
-
-    # Loading longer OpenML Datasets for generalization experiments (optional)
-    # test_datasets_multiclass, test_datasets_multiclass_df = load_openml_list(test_dids_classification, multiclass=True, shuffled=True, filter_for_nan=False, max_samples = 10000, num_feats=100, return_capped=True)
-
-    random.seed(0)
-    random.shuffle(cc_valid_datasets_multiclass)
-
-    def get_datasets(selector, task_type, suite="cc"):
-        if task_type == "binary":
-            ds = valid_datasets_binary if selector == "valid" else test_datasets_binary
-        else:
-            if suite == "openml":
-                ds = (
-                    valid_datasets_multiclass
-                    if selector == "valid"
-                    else test_datasets_multiclass
-                )
-            elif suite == "cc":
-                ds = (
-                    cc_valid_datasets_multiclass
-                    if selector == "valid"
-                    else cc_test_datasets_multiclass
-                )
-            else:
-                raise Exception("Unknown suite")
-        return ds
-
-    model_string, longer, task_type = "", 1, "multiclass"
-    eval_positions = [1000]
-    bptt = 2000
-
-    test_datasets, valid_datasets = get_datasets(
-        "test", task_type, suite="cc"
-    ), get_datasets("valid", task_type, suite="cc")
-
-    ds = test_datasets[dataset_id]
-    print(f"Evaluation dataset name: {ds[0]} shape {ds[1].shape}")
-
-    xs, ys = ds[1].clone(), ds[2].clone()
-    eval_position = xs.shape[0] // 2
-    train_xs, train_ys = xs[0:eval_position], ys[0:eval_position]
-    test_xs, test_ys = xs[eval_position:], ys[eval_position:]
-    if debug:
-        train_xs = train_xs[:16]
-        train_ys = train_ys[:16]
-        test_xs = test_xs[:16]
-        test_ys = test_ys[:16]
-    classifier = TabPFNClassifier(device="cuda")
-
-    classifier.fit(train_xs, train_ys)
-    orig_prediction_ = classifier.predict_proba(test_xs)
-    orig_predicted_labels = orig_prediction_.argmax(axis=1)
-    model = classifier.model[2]
-    from sklearn.utils.validation import check_array
-
-    device = "cuda"
-    X = test_xs
-
-    # Input validation
-    X = check_array(X, force_all_finite=False)
-    X_full = np.concatenate([train_xs, X], axis=0)
-    X_full = torch.tensor(X_full, device=device).float().unsqueeze(1)
-    y_full = np.concatenate([train_ys, np.zeros_like(X[:, 0])], axis=0)
-    y_full = torch.tensor(y_full, device=device).float().unsqueeze(1)
-
-    eval_pos = train_xs.shape[0]
     style = None
     inference_mode = False
     preprocess_transform = "mix"
@@ -436,73 +425,64 @@ def run_exp(
     extend_features = True  # from function defaults
     batch_size_inference = 16
 
-    eval_xs = X_full
-    eval_ys = y_full
-    eval_position = eval_pos
+    if data_collection == 'all':
+        train_xs, train_ys, test_xs, test_ys = load_from_all_datasets(dataset_id)
+    else:
+        assert data_collection == 'cafee'
+        train_xs, train_ys, test_xs, test_ys = load_from_well_described_datasets(dataset_id)
+
+    if debug:
+        train_xs = train_xs[:16]
+        train_ys = train_ys[:16]
+        test_xs = test_xs[:16]
+        test_ys = test_ys[:16]
+    classifier = TabPFNClassifier(device="cuda")
+
+    model = classifier.model[2]
+    from sklearn.utils.validation import check_array
+
+    device = "cuda"
+
+    # Input validation
+    eval_xs = np.concatenate([train_xs, test_xs], axis=0)
+    eval_xs = torch.tensor(eval_xs, device=device).float().unsqueeze(1)
+    eval_ys = torch.tensor(train_ys).float().unsqueeze(1)
+    eval_position = len(train_xs)
+
     num_classes = len(torch.unique(eval_ys))
-
+    num_features = eval_xs.shape[2]
     eval_xs, eval_ys = eval_xs.to(device), eval_ys.to(device)
-    eval_ys = eval_ys[:eval_position]
 
-    model.to(device)
+    model.to(device);
+
+    ensemble_configurations = generate_ensemble_configurations(
+        differentiable_hps_as_style,
+        style,
+        seed,
+        device,
+        softmax_temperature,
+        preprocess_transform,
+        num_features,
+        feature_shift_decoder,
+        num_classes,
+        multiclass_decoder,
+        N_ensemble_configurations,
+    )
+
+    # fix first ensemble configuration to be without preprocessor
+
+    ensemble_configurations[0] = (
+        (0, 0),
+        'none',
+        0,
+    )
 
     import itertools
 
-    if not differentiable_hps_as_style:
-        style = None
-
-    if style is not None:
-        style = style.to(device)
-        style = style.unsqueeze(0) if len(style.shape) == 1 else style
-        num_styles = style.shape[0]
-        softmax_temperature = (
-            softmax_temperature
-            if softmax_temperature.shape
-            else softmax_temperature.unsqueeze(0).repeat(num_styles)
-        )
-    else:
-        num_styles = 1
-        style = None
-        softmax_temperature = torch.log(torch.tensor([0.8]))
-
-    styles_configurations = range(0, num_styles)
-
-    preprocess_transform_configurations = (
-        ["none", "power_all"]
-        if preprocess_transform == "mix"
-        else [preprocess_transform]
-    )
-
-    if seed is not None:
-        torch.manual_seed(seed)
-    print(preprocess_transform_configurations)
-
-    feature_shift_configurations = (
-        torch.randperm(eval_xs.shape[2]) if feature_shift_decoder else [0]
-    )
-    class_shift_configurations = (
-        torch.randperm(len(torch.unique(eval_ys)))
-        if multiclass_decoder == "permutation"
-        else [0]
-    )
-    ensemble_configurations = list(
-        itertools.product(class_shift_configurations, feature_shift_configurations)
-    )
-    # default_ensemble_config = ensemble_configurations[0]
-    rng = random.Random(seed)
-    rng.shuffle(ensemble_configurations)
-    ensemble_configurations = list(
-        itertools.product(
-            ensemble_configurations,
-            preprocess_transform_configurations,
-            styles_configurations,
-        )
-    )
-    ensemble_configurations = ensemble_configurations[0:N_ensemble_configurations]
     # if N_ensemble_configurations == 1:
     #    ensemble_configurations = [default_ensemble_config]
 
-    inputs, labels, yeo_params, mean_std_params = get_inputs_for_ensemble(
+    inputs, labels, yeo_params, feature_mean, feature_std = get_inputs_for_ensemble(
         eval_xs,
         eval_ys,
         ensemble_configurations,
@@ -515,7 +495,8 @@ def run_exp(
         normalize_with_sqrt=normalize_with_sqrt,
         normalize_to_ranking=normalize_to_ranking,
         yeo_params_per_transform=None,
-        mean_std_per_transform=None,
+        feature_mean=None,
+        feature_std=None,
     )
 
     assert len(inputs) == 1
@@ -561,26 +542,35 @@ def run_exp(
             ensemble_configurations,
         )
     if backprop_preproc:
-        train_x_extra_dim = eval_xs[:len(train_xs)]
-        train_y_extra_dim = eval_ys[:len(train_xs)]
+        train_x_for_syn, _, _ = normalize_data_return_mean_std(
+            eval_xs[:len(train_xs)], mean=feature_mean, std=feature_std)
+        train_y_for_syn = eval_ys[:len(train_xs)]
     else:
-        train_x_extra_dim = train_input
-        train_y_extra_dim = batch_label
+        train_x_for_syn = train_input
+        train_y_for_syn = batch_label
 
-    necessary_repeats = int(np.ceil(n_samples / len(train_x_extra_dim)))
+    # https://stackoverflow.com/a/37414115
+    n_samples_per_class = [(n_samples // num_classes) + (1 if i < (n_samples % num_classes) else 0) for i in
+                           range(num_classes)]
 
-    inputs_repeated = train_x_extra_dim.repeat(
-        necessary_repeats, *((1,) * (len(batch_input.shape) - 1))
-    )
-    labels_repeated = train_y_extra_dim.repeat(
-        necessary_repeats, *((1,) * (len(batch_label.shape) - 1))
-    )
-
-    syn_X = inputs_repeated[:n_samples].cuda().detach().clone().requires_grad_(True)
-    syn_y = (
-        labels_repeated[:n_samples].float().cuda().detach().clone().requires_grad_(True)
-    )
-
+    syn_Xs = []
+    syn_ys = []
+    for n_samples_this_class, y in zip(n_samples_per_class, torch.unique(train_ys)):
+        this_class_x = train_x_for_syn[train_ys == y]
+        this_class_y = train_y_for_syn[train_ys == y]
+        necessary_repeats = int(np.ceil(n_samples_this_class / len(this_class_x)))
+        x_repeated = this_class_x.repeat(
+            necessary_repeats, *((1,) * (len(this_class_x.shape) - 1))
+        )
+        y_repeated = this_class_y.repeat(
+            necessary_repeats, *((1,) * (len(this_class_y.shape) - 1))
+        )
+        syn_Xs.append(x_repeated[:n_samples_this_class])
+        syn_ys.append(y_repeated[:n_samples_this_class])
+    syn_X = torch.cat(syn_Xs).cuda().detach().clone().requires_grad_(True)
+    syn_y = torch.cat(syn_ys).cuda().detach().clone().requires_grad_(True)
+    if init_syn_random:
+        syn_X.data[:] = (torch.randn_like(syn_X) * 0.05).data[:]
     if weight_synthetic_points:
         seq_attn_alphas = (
             torch.zeros_like(syn_X[:, 0, 0]).cuda().detach().requires_grad_(True)
@@ -591,17 +581,18 @@ def run_exp(
     if len(included_classes) == 1:
         included_class = included_classes[0]
         ind_other_class = np.flatnonzero(train_ys != included_class)[0]
-        syn_X.data[-1] = train_x_extra_dim[ind_other_class].cuda().data[:]
-        syn_y.data[-1] = train_y_extra_dim[ind_other_class].float().cuda().data[:]
+        syn_X.data[-1] = train_x_for_syn[ind_other_class].cuda().data[:]
+        syn_y.data[-1] = train_y_for_syn[ind_other_class].float().cuda().data[:]
 
-    # impadd
     # Ensure we have at least two features
     if backprop_preproc:
         for i_col in range(syn_X.shape[2]):
             if len(torch.unique(syn_X[:, 0, i_col])) < 2:
                 syn_X.data[-1, 0, i_col] += 0.1
 
-    params_to_optim = [dict(params=[syn_X, syn_y], lr=1e-2)]
+    params_to_optim = [dict(params=[syn_X, ], lr=1e-2)]
+    if synthesize_targets:
+        params_to_optim.append(dict(params=[syn_y], lr=1e-2))
     if weight_synthetic_points:
         params_to_optim.append(dict(params=[seq_attn_alphas], lr=3e-2))
 
@@ -609,24 +600,32 @@ def run_exp(
 
     for i_epoch in trange(n_epochs):
         if weight_synthetic_points:
-            softmaxed_seq_attn_mask = torch.nn.functional.softmax(seq_attn_alphas, dim=0)
+            softmaxed_seq_attn_mask = torch.nn.functional.softmax(
+                seq_attn_alphas, dim=0
+            )
 
             for module in transformed_model.transformer_encoder.modules():
                 if hasattr(module, "seq_attention_mask"):
                     module.seq_attention_mask = softmaxed_seq_attn_mask
                     module.avg_attentions = []
         if backprop_preproc:
-            syn_X_preproced, syn_y_preproced, _, _ = get_inputs_for_ensemble(
-                syn_X, syn_y, ensemble_configurations,
+            syn_X_preproced, syn_y_preproced, _, _, _ = get_inputs_for_ensemble(
+                syn_X,
+                syn_y,
+                ensemble_configurations,
                 style,
                 num_classes=num_classes,
-                max_features=max_features, extend_features=extend_features,
+                max_features=max_features,
+                extend_features=extend_features,
                 normalize_with_test=normalize_with_test,
                 eval_position=eval_position,
                 normalize_with_sqrt=normalize_with_sqrt,
                 normalize_to_ranking=normalize_to_ranking,
                 yeo_params_per_transform=yeo_params,
-                mean_std_per_transform=mean_std_params)
+                # Assume normalized already
+                feature_mean=0,
+                feature_std=1,
+            )
 
             syn_X_preproced = syn_X_preproced[0]
             syn_y_preproced = syn_y_preproced[0]
@@ -644,8 +643,15 @@ def run_exp(
         opt_syn_X_y.zero_grad(set_to_none=True)
         kl_div.backward()
         opt_syn_X_y.step()
+        if zero_nonexistent_features:
+            syn_X.data[:, :, num_features:] = 0  # do not optimize nonexisting features
         opt_syn_X_y.zero_grad(set_to_none=True)
         acc = torch.mean(1.0 * (merged_output.argmax(dim=1).cpu() == train_ys)).item()
+        auc = auc_metric(
+            train_ys.cpu().numpy(),
+            torch.softmax(merged_output, dim=1).detach().cpu().numpy(),
+            multi_class="ovo",
+        )
 
         # Ensure we have at least two features
         if backprop_preproc:
@@ -664,38 +670,57 @@ def run_exp(
                             module.seq_attention_mask = softmaxed_seq_attn_mask
                             module.avg_attentions = []
 
-            if backprop_preproc:
-                syn_X_preproced, syn_y_preproced, _, _ = get_inputs_for_ensemble(
-                    syn_X, syn_y, ensemble_configurations,
-                    style,
-                    num_classes=num_classes,
-                    max_features=max_features, extend_features=extend_features,
-                    normalize_with_test=normalize_with_test,
-                    eval_position=eval_position,
-                    normalize_with_sqrt=normalize_with_sqrt,
-                    normalize_to_ranking=normalize_to_ranking,
-                    yeo_params_per_transform=yeo_params,
-                    mean_std_per_transform=mean_std_params)
-                syn_X_preproced = syn_X_preproced[0]
-                syn_y_preproced = syn_y_preproced[0]
-            else:
-                syn_X_preproced = syn_X
-                syn_y_preproced = syn_y
-            merged_output = predict_outputs(
-                transformed_model,
-                torch.cat((syn_X_preproced, test_input)),
-                syn_y_preproced,
-                num_classes,
-                ensemble_configurations,
-            )
+            with torch.no_grad():
+                if backprop_preproc:
+                    syn_X_preproced, syn_y_preproced, _, _, _ = get_inputs_for_ensemble(
+                        syn_X,
+                        syn_y,
+                        ensemble_configurations,
+                        style,
+                        num_classes=num_classes,
+                        max_features=max_features,
+                        extend_features=extend_features,
+                        normalize_with_test=normalize_with_test,
+                        eval_position=eval_position,
+                        normalize_with_sqrt=normalize_with_sqrt,
+                        normalize_to_ranking=normalize_to_ranking,
+                        yeo_params_per_transform=yeo_params,
+                        feature_mean=0,
+                        feature_std=1,
+                    )
+                    syn_X_preproced = syn_X_preproced[0]
+                    syn_y_preproced = syn_y_preproced[0]
+                else:
+                    syn_X_preproced = syn_X
+                    syn_y_preproced = syn_y
+                merged_output = predict_outputs(
+                    transformed_model,
+                    torch.cat((syn_X_preproced, test_input)),
+                    syn_y_preproced,
+                    num_classes,
+                    ensemble_configurations,
+                )
             test_acc = torch.mean(
                 1.0 * (merged_output.argmax(dim=1).cpu() == test_ys)
             ).item()
-            print(f"KL Divergence: {kl_div.item():.2E}")
+            test_auc = auc_metric(
+                test_ys.cpu().numpy(),
+                torch.softmax(merged_output, dim=1).cpu().numpy(),
+                multi_class="ovo",
+            )
+            print(f"KL Divergence:  {kl_div.item():.2E}")
             print(f"Train Accuracy: {acc:.1%}")
-            print(f"Test Accuracy: {test_acc:.1%}")
+            print(f"Train AUC:      {auc:.1%}")
+            print(f"Test Accuracy:  {test_acc:.1%}")
+            print(f"Test AUC:       {test_auc:.1%}")
 
-    results = dict(test_acc=test_acc, train_acc=acc, kl_div=kl_div.item())
+    results = dict(
+        test_acc=test_acc,
+        test_auc=test_auc,
+        train_auc=auc,
+        train_acc=acc,
+        kl_div=kl_div.item(),
+    )
     np.save(
         os.path.join(output_dir, "syn_X.npy"),
         syn_X.detach().cpu().numpy(),
