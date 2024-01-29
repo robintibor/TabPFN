@@ -36,19 +36,21 @@ def get_grid_param_list():
     debug_params = [
         {
             "debug": False,
+            "version": "workshop",
         }
     ]
 
     data_params = dictlistprod(
         {
-            "dataset_id": range(10),
-            "data_collection": ["cafee"],
+            "dataset_id": range(30),
+            "data_collection": ["all"],
                 }
     )
 
     train_params = dictlistprod(
         {
-            "proxy_labels": ["train"],
+            "proxy_labels": ["tabpfn"],
+            "N_ensemble_configurations": [1],
         }
     )
 
@@ -81,10 +83,13 @@ def run(
     np_th_seed,
     proxy_labels,
     data_collection,
+    version,
     debug,
+    N_ensemble_configurations,
 ):
     kwargs = locals()
     kwargs.pop("ex")
+    kwargs.pop("version")
     if not debug:
         log.setLevel("INFO")
     file_obs = ex.observers[0]

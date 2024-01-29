@@ -21,6 +21,7 @@ def run_exp(
     output_dir,
     data_collection,
     debug,
+    N_ensemble_configurations,
 ):
     tqdm = lambda x: x
     trange = range
@@ -34,7 +35,7 @@ def run_exp(
         train_ys = train_ys[:16]
         test_xs = test_xs[:16]
         test_ys = test_ys[:16]
-    classifier = TabPFNClassifier(device="cuda")
+    classifier = TabPFNClassifier(device="cuda", N_ensemble_configurations=N_ensemble_configurations)
 
     classifier.fit(train_xs, train_ys, overwrite_warning=True)
     orig_prediction_ = classifier.predict_proba(test_xs)

@@ -42,22 +42,28 @@ def get_grid_param_list():
 
     data_params = dictlistprod(
         {
-            "dataset_id": range(10),
-            "n_samples": [2,4,8,16,32,64,128,256,], #2,4,8,16,32 check missing
-            "data_collection": ["cafee"],
+            "dataset_id": range(30),
+            "n_samples_per_class": [None],
+            # "n_samples_per_class": [1,2,4,8,16,32,64,128,], #2,4,8,16,32 check missing
+            "n_samples": [
+                512,
+                1024,
+            ],  # [2,4,8,16,32,64,128,256], #2,4,8,16,32 check missing
+            "data_collection": ["all"],
         }
     )
 
     train_params = dictlistprod(
         {
-            "proxy_labels": ["tabpfn"],
-            "n_epochs": [1000],
+            "proxy_labels": ["train"],
+            "n_epochs": [500],
             "weight_synthetic_points": [False],
-            "backprop_preproc": [True],
-            "N_ensemble_configurations": [1],
+            "backprop_preproc": [False],
+            "N_ensemble_configurations": [3],
             "synthesize_targets": [False],
-            "zero_nonexistent_features": [True],
-            "init_syn_random": [True],
+            "zero_nonexistent_features": [False],
+            "init_syn_random": [False],
+            "sample_features_prob": [0.0],
         }
     )
 
@@ -81,7 +87,7 @@ def run(
     ex,
     dataset_id,
     proxy_labels,
-    n_samples,
+    n_samples_per_class,
     n_epochs,
     weight_synthetic_points,
     debug,
@@ -92,6 +98,8 @@ def run(
     synthesize_targets,
     zero_nonexistent_features,
     init_syn_random,
+    n_samples,
+    sample_features_prob,
 ):
     kwargs = locals()
     kwargs.pop("ex")

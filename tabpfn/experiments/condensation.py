@@ -392,7 +392,7 @@ def _yeo_johnson_transform_th(x, lmbda):
 
 def run_exp(
     dataset_id,
-    n_samples,
+    n_samples_per_class,
     proxy_labels,
     output_dir,
     debug,
@@ -404,6 +404,8 @@ def run_exp(
     synthesize_targets,
     zero_nonexistent_features,
     init_syn_random,
+    n_samples,
+    sample_features_prob,
 ):
     tqdm = lambda x: x
     trange = range
@@ -550,23 +552,34 @@ def run_exp(
         train_y_for_syn = batch_label
 
     # https://stackoverflow.com/a/37414115
-    n_samples_per_class = [(n_samples // num_classes) + (1 if i < (n_samples % num_classes) else 0) for i in
-                           range(num_classes)]
 
-    syn_Xs = []
-    syn_ys = []
-    for n_samples_this_class, y in zip(n_samples_per_class, torch.unique(train_ys)):
-        this_class_x = train_x_for_syn[train_ys == y]
-        this_class_y = train_y_for_syn[train_ys == y]
-        necessary_repeats = int(np.ceil(n_samples_this_class / len(this_class_x)))
-        x_repeated = this_class_x.repeat(
-            necessary_repeats, *((1,) * (len(this_class_x.shape) - 1))
-        )
-        y_repeated = this_class_y.repeat(
-            necessary_repeats, *((1,) * (len(this_class_y.shape) - 1))
-        )
-        syn_Xs.append(x_repeated[:n_samples_this_class])
-        syn_ys.append(y_repeated[:n_samples_this_class])
+    
+    if n_samples_per_class is not None:
+        syn_Xs = []
+        syn_ys = []
+        for y in torch.unique(train_ys):
+            this_class_x = train_x_for_syn[train_ys == y]
+            this_class_y = train_y_for_syn[train_ys == y]
+            necessary_repeats = int(np.ceil(n_samples_per_class / len(this_class_x)))
+            x_repeated = this_class_x.repeat(
+                necessary_repeats, *((1,) * (len(this_class_x.shape) - 1))
+            )
+            y_repeated = this_class_y.repeat(
+                necessary_repeats, *((1,) * (len(this_class_y.shape) - 1))
+            )
+            syn_Xs.append(x_repeated[:n_samples_per_class])
+            syn_ys.append(y_repeated[:n_samples_per_class])
+    else:
+        assert n_samples is not None
+        syn_X = train_x_for_syn[:n_samples]
+        syn_y = train_y_for_syn[:n_samples]
+        included_classes = torch.unique(syn_y)
+        if len(included_classes) == 1:
+            ind_other_class = torch.nonzero(train_y_for_syn != included_classes[0])[0,0].item()
+            syn_X = torch.cat((syn_X[:-1], train_x_for_syn[ind_other_class:ind_other_class+1]))
+            syn_y = torch.cat((syn_y[:-1], train_y_for_syn[ind_other_class:ind_other_class+1]))
+        syn_Xs = [syn_X]
+        syn_ys = [syn_y]
     syn_X = torch.cat(syn_Xs).cuda().detach().clone().requires_grad_(True)
     syn_y = torch.cat(syn_ys).cuda().detach().clone().requires_grad_(True)
     if init_syn_random:
@@ -575,14 +588,6 @@ def run_exp(
         seq_attn_alphas = (
             torch.zeros_like(syn_X[:, 0, 0]).cuda().detach().requires_grad_(True)
         )
-
-    # Ensure we have at least two classes
-    included_classes = np.unique(train_ys[:n_samples])
-    if len(included_classes) == 1:
-        included_class = included_classes[0]
-        ind_other_class = np.flatnonzero(train_ys != included_class)[0]
-        syn_X.data[-1] = train_x_for_syn[ind_other_class].cuda().data[:]
-        syn_y.data[-1] = train_y_for_syn[ind_other_class].float().cuda().data[:]
 
     # Ensure we have at least two features
     if backprop_preproc:
@@ -632,14 +637,43 @@ def run_exp(
         else:
             syn_X_preproced = syn_X
             syn_y_preproced = syn_y
+        if sample_features_prob > 0:
+            mask = torch.bernoulli(
+                    torch.ones_like(train_input) * (1-sample_features_prob),
+                )
+            if i_epoch == n_epochs -1 :
+                # last batch just take normal data, also to get correct train auc
+                mask = torch.ones_like(train_input)
+            i_permute = torch.randint(
+                train_input.shape[0], train_input.shape, device="cuda"
+            )
+            this_test_inputs = (
+                mask * train_input
+                + (1 - mask) * train_input.gather(dim=0, index=i_permute)
+            )
+            with torch.no_grad():
+                merged_orig_output = predict_outputs(
+                    model,
+                    torch.cat((train_input, this_test_inputs)),
+                    batch_label.float(),
+                    num_classes,
+                    ensemble_configurations,
+                )
+        else:
+            this_test_inputs = train_input
         merged_output = predict_outputs(
             transformed_model,
-            torch.cat((syn_X_preproced, train_input)),
+            torch.cat((syn_X_preproced, this_test_inputs)),
             syn_y_preproced,
             num_classes,
             ensemble_configurations,
         )
-        kl_div = kl_divergence(merged_orig_output, merged_output)
+        if proxy_labels == "tabpfn":
+            kl_div = kl_divergence(merged_orig_output, merged_output)
+        else:
+            assert proxy_labels == "train"
+            kl_div = torch.nn.functional.cross_entropy(
+                merged_output, eval_ys.squeeze().type(torch.int64))
         opt_syn_X_y.zero_grad(set_to_none=True)
         kl_div.backward()
         opt_syn_X_y.step()
